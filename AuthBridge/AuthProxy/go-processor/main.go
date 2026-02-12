@@ -10,8 +10,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -19,6 +21,15 @@ import (
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/lestrrat-go/jwx/v2/jwt"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -38,8 +49,82 @@ type Config struct {
 
 var globalConfig = &Config{}
 
+var tracer trace.Tracer
+
 type processor struct {
 	v3.UnimplementedExternalProcessorServer
+}
+
+// envoyHeaderCarrier implements propagation.TextMapCarrier for Envoy HeaderMap.
+// It extracts trace context (W3C traceparent) from the HTTP headers that
+// Envoy sends to the ext-proc inside the ProcessingRequest protobuf message.
+type envoyHeaderCarrier struct {
+	headers []*core.HeaderValue
+}
+
+func (c envoyHeaderCarrier) Get(key string) string {
+	for _, h := range c.headers {
+		if strings.EqualFold(h.Key, key) {
+			return string(h.RawValue)
+		}
+	}
+	return ""
+}
+
+func (c envoyHeaderCarrier) Set(string, string) {}
+
+func (c envoyHeaderCarrier) Keys() []string {
+	keys := make([]string, len(c.headers))
+	for i, h := range c.headers {
+		keys[i] = h.Key
+	}
+	return keys
+}
+
+// initTracer initializes OpenTelemetry tracing. When OTEL_ENABLED is not "true",
+// a no-op tracer is used so all span creation code is safe to call unconditionally.
+func initTracer(ctx context.Context) (func(context.Context) error, error) {
+	if os.Getenv("OTEL_ENABLED") != "true" {
+		tracer = trace.NewNoopTracerProvider().Tracer("authbridge-ext-proc")
+		return func(context.Context) error { return nil }, nil
+	}
+
+	endpoint := os.Getenv("OTEL_COLLECTOR_ENDPOINT")
+	if endpoint == "" {
+		endpoint = "otel-collector:4317"
+	}
+
+	res, err := resource.New(ctx,
+		resource.WithAttributes(semconv.ServiceName("authbridge-ext-proc")),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OTel resource: %w", err)
+	}
+
+	exporter, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithEndpoint(endpoint),
+		otlptracegrpc.WithInsecure(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OTLP exporter: %w", err)
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	tracer = tp.Tracer("authbridge-ext-proc")
+	log.Printf("[OTel] Tracing enabled, exporting to %s", endpoint)
+
+	return tp.Shutdown, nil
 }
 
 type tokenExchangeResponse struct {
@@ -305,7 +390,14 @@ func getHeaderValue(headers []*core.HeaderValue, key string) string {
 }
 
 // handleInbound processes inbound traffic by validating the JWT token.
-func (p *processor) handleInbound(headers *core.HeaderMap) *v3.ProcessingResponse {
+func (p *processor) handleInbound(ctx context.Context, headers *core.HeaderMap) *v3.ProcessingResponse {
+	reqPath := getHeaderValue(headers.Headers, ":path")
+	ctx, span := tracer.Start(ctx, "ext_proc.inbound",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(attribute.String("http.path", reqPath)),
+	)
+	defer span.End()
+
 	log.Println("=== Inbound Request Headers ===")
 	if headers != nil {
 		for _, header := range headers.Headers {
@@ -318,6 +410,7 @@ func (p *processor) handleInbound(headers *core.HeaderMap) *v3.ProcessingRespons
 
 	if jwksCache == nil || inboundIssuer == "" {
 		log.Println("[Inbound] Inbound validation not configured (ISSUER or TOKEN_URL missing), skipping")
+		span.SetAttributes(attribute.String("authbridge.action", "skip_validation_not_configured"))
 		return &v3.ProcessingResponse{
 			Response: &v3.ProcessingResponse_RequestHeaders{
 				RequestHeaders: &v3.HeadersResponse{},
@@ -328,20 +421,38 @@ func (p *processor) handleInbound(headers *core.HeaderMap) *v3.ProcessingRespons
 	authHeader := getHeaderValue(headers.Headers, "authorization")
 	if authHeader == "" {
 		log.Println("[Inbound] Missing Authorization header")
-		return denyRequest("missing Authorization header")
+		span.SetAttributes(attribute.String("authbridge.action", "passthrough_no_token"))
+		return &v3.ProcessingResponse{
+			Response: &v3.ProcessingResponse_RequestHeaders{
+				RequestHeaders: &v3.HeadersResponse{},
+			},
+		}
 	}
 
 	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 	tokenString = strings.TrimPrefix(tokenString, "bearer ")
 	if tokenString == authHeader {
 		log.Println("[Inbound] Invalid Authorization header format")
+		span.SetAttributes(attribute.String("authbridge.action", "deny_invalid_format"))
 		return denyRequest("invalid Authorization header format")
 	}
 
+	_, childSpan := tracer.Start(ctx, "jwt_validation", trace.WithSpanKind(trace.SpanKindInternal))
+
 	if err := validateInboundJWT(tokenString, inboundJWKSURL, inboundIssuer); err != nil {
 		log.Printf("[Inbound] JWT validation failed: %v", err)
+		childSpan.RecordError(err)
+		childSpan.SetStatus(otelcodes.Error, err.Error())
+		childSpan.End()
+		span.SetAttributes(attribute.String("authbridge.action", "deny_validation_failed"))
 		return denyRequest(fmt.Sprintf("token validation failed: %v", err))
 	}
+
+	childSpan.SetAttributes(attribute.String("jwt.issuer", inboundIssuer))
+	childSpan.SetStatus(otelcodes.Ok, "")
+	childSpan.End()
+
+	span.SetAttributes(attribute.String("authbridge.action", "validated"))
 
 	log.Println("[Inbound] JWT validation succeeded, forwarding request")
 	// Remove the x-authbridge-direction header so the app never sees it
@@ -361,6 +472,17 @@ func (p *processor) handleInbound(headers *core.HeaderMap) *v3.ProcessingRespons
 // handleOutbound processes outbound traffic by performing token exchange.
 // It uses the resolver to get per-host configuration for audience/scopes/tokenURL.
 func (p *processor) handleOutbound(ctx context.Context, headers *core.HeaderMap) *v3.ProcessingResponse {
+	reqPath := getHeaderValue(headers.Headers, ":path")
+	reqAuthority := getHeaderValue(headers.Headers, ":authority")
+	ctx, span := tracer.Start(ctx, "ext_proc.outbound",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.String("http.path", reqPath),
+			attribute.String("http.authority", reqAuthority),
+		),
+	)
+	defer span.End()
+
 	log.Println("=== Outbound Request Headers ===")
 	if headers != nil {
 		for _, header := range headers.Headers {
@@ -420,8 +542,19 @@ func (p *processor) handleOutbound(ctx context.Context, headers *core.HeaderMap)
 			subjectToken = strings.TrimPrefix(subjectToken, "bearer ")
 
 			if subjectToken != authHeader {
+				_, childSpan := tracer.Start(ctx, "token_exchange", trace.WithSpanKind(trace.SpanKindInternal))
+
 				newToken, err := exchangeToken(clientID, clientSecret, tokenURL, subjectToken, targetAudience, targetScopes)
 				if err == nil {
+					childSpan.SetAttributes(
+						attribute.String("token.aud.after", targetAudience),
+						attribute.String("exchange.grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"),
+					)
+					childSpan.SetStatus(otelcodes.Ok, "")
+					childSpan.End()
+
+					span.SetAttributes(attribute.String("authbridge.action", "token_exchanged"))
+
 					log.Printf("[Token Exchange] Successfully exchanged token, replacing Authorization header")
 					return &v3.ProcessingResponse{
 						Response: &v3.ProcessingResponse_RequestHeaders{
@@ -442,14 +575,21 @@ func (p *processor) handleOutbound(ctx context.Context, headers *core.HeaderMap)
 						},
 					}
 				}
+				childSpan.RecordError(err)
+				childSpan.SetStatus(otelcodes.Error, err.Error())
+				childSpan.End()
+				span.SetAttributes(attribute.String("authbridge.action", "token_exchange_failed"))
 				log.Printf("[Token Exchange] Failed to exchange token: %v", err)
 			} else {
+				span.SetAttributes(attribute.String("authbridge.action", "passthrough_invalid_format"))
 				log.Printf("[Token Exchange] Invalid Authorization header format")
 			}
 		} else {
+			span.SetAttributes(attribute.String("authbridge.action", "passthrough_no_token"))
 			log.Printf("[Token Exchange] No Authorization header found")
 		}
 	} else {
+		span.SetAttributes(attribute.String("authbridge.action", "passthrough_not_configured"))
 		log.Println("[Token Exchange] Missing configuration, skipping token exchange")
 		log.Printf("[Token Exchange] CLIENT_ID present: %v, CLIENT_SECRET present: %v, TOKEN_URL present: %v",
 			clientID != "", clientSecret != "", tokenURL != "")
@@ -485,10 +625,14 @@ func (p *processor) Process(stream v3.ExternalProcessor_ProcessServer) error {
 			headers := r.RequestHeaders.Headers
 			direction := getHeaderValue(headers.Headers, "x-authbridge-direction")
 
+			// Extract W3C trace context from the HTTP headers Envoy passes to us
+			prop := otel.GetTextMapPropagator()
+			reqCtx := prop.Extract(ctx, envoyHeaderCarrier{headers: headers.Headers})
+
 			if direction == "inbound" {
-				resp = p.handleInbound(headers)
+				resp = p.handleInbound(reqCtx, headers)
 			} else {
-				resp = p.handleOutbound(ctx, headers)
+				resp = p.handleOutbound(reqCtx, headers)
 			}
 
 		case *v3.ProcessingRequest_ResponseHeaders:
@@ -525,6 +669,15 @@ func main() {
 	// Load configuration from files (or environment variables as fallback)
 	loadConfig()
 
+	// Initialize OpenTelemetry tracing
+	ctx := context.Background()
+	otelShutdown, err := initTracer(ctx)
+	if err != nil {
+		log.Printf("[OTel] Failed to initialize tracing: %v", err)
+		tracer = trace.NewNoopTracerProvider().Tracer("authbridge-ext-proc")
+		otelShutdown = func(context.Context) error { return nil }
+	}
+
 	// Initialize inbound JWT validation
 	_, _, tokenURL, _, _ := getConfig()
 	inboundIssuer = os.Getenv("ISSUER")
@@ -552,7 +705,6 @@ func main() {
 	if configPath == "" {
 		configPath = defaultRoutesConfigPath
 	}
-	var err error
 	globalResolver, err = resolver.NewStaticResolver(configPath)
 	if err != nil {
 		log.Fatalf("failed to load routes config: %v", err)
@@ -568,8 +720,24 @@ func main() {
 	grpcServer := grpc.NewServer()
 	v3.RegisterExternalProcessorServer(grpcServer, &processor{})
 
+	// Graceful shutdown on SIGTERM/SIGINT so deferred otelShutdown flushes spans
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sigCh
+		log.Println("Shutting down ext-proc...")
+		grpcServer.GracefulStop()
+	}()
+
 	log.Printf("Starting Go external processor on %s", port)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
+	}
+
+	// Flush pending spans
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := otelShutdown(shutdownCtx); err != nil {
+		log.Printf("[OTel] Failed to shutdown tracing: %v", err)
 	}
 }
