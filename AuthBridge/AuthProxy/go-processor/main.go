@@ -419,6 +419,14 @@ func (p *processor) handleOutbound(ctx context.Context, headers *core.HeaderMap)
 		}
 	}
 
+	// Log delegation headers (forwarded by A2A agents for OPA authorization)
+	if delegUser := getHeaderValue(headers.Headers, "x-delegation-user"); delegUser != "" {
+		log.Printf("[Delegation] X-Delegation-User: %s", delegUser)
+	}
+	if delegAgent := getHeaderValue(headers.Headers, "x-delegation-agent"); delegAgent != "" {
+		log.Printf("[Delegation] X-Delegation-Agent: %s", delegAgent)
+	}
+
 	// Extract host and resolve target configuration
 	requestHost := getHostFromHeaders(headers.Headers)
 	targetConfig, err := globalResolver.Resolve(ctx, requestHost)
